@@ -2,6 +2,9 @@ import os
 import subprocess
 from tqdm import tqdm
 import logging
+import tempfile
+from multiprocessing import Pool
+from functools import partial
 
 
 logging.basicConfig(filename=r"D:\flac2opus.log", filemode="a", encoding='utf-8', format="%(asctime)s [%(levelname)s]: %(message)s", datefmt="%Y/%m/%d %H:%M:%S", level=logging.WARNING)
@@ -45,45 +48,50 @@ def flac2wav(flac, wav):
 def resample(wav):
     """sox高品质重采样"""
 
-    # 提取输入文件的目录和文件名（不带扩展名）
+    vol = 0.0
     clip_err = ""
-    name = os.path.splitext(os.path.basename(wav))[0]
+    name = os.path.splitext(os.path.basename(wav))[0] # 输入文件名（不带扩展名）
     directory = os.path.dirname(wav)
     temp_file = os.path.join(directory, f"{name}_48khz.wav")
+    temp_dir = tempfile.mkdtemp(dir=r"D:\tmp") # 创建进程专用的临时目录
 
-    result = subprocess.run([
-        "sox_ng", "--temp", r"D:\tmp", "--multi-threaded", "-G", wav, "-b", "16", temp_file, "rate", "-v", "-I", "-b", "97","48000", "dither", "-s"
-        ], stderr=subprocess.PIPE, text=True, check=True)
-    
-    if "decrease volume?" in result.stderr:
-        vol = 0.0
-    elif result.stderr:
-        logging.warning("'" + name + "' -> " + result.stderr)
-        
-    while "decrease volume?" in result.stderr:
-        if vol > -1.8:
-            vol -= 0.2
-            vol = round(vol, 1)
-        else:
-            logging.warning("'" + name + "' still clipped at vol -1.8dB. bad record!")
-            clip_err = " " + result.stderr
-            break
-
-        logging.warning("'" + name + "' -> " + result.stderr + " vol = " + f"{vol:.1f}dB")
-
-        os.remove(temp_file)
-        
+    try:
         result = subprocess.run([
-            "sox_ng", "--temp", r"D:\tmp", "--multi-threaded", "-G", wav, "-b", "16", temp_file, "vol", f"{vol:.1f}dB", "rate", "-v", "-I", "-b", "97","48000", "dither", "-s"
+            "sox_ng", "--temp", temp_dir, "--multi-threaded", "-G", wav, "-b", "16", temp_file, "rate", "-v", "-I", "-b", "97","48000", "dither", "-s"
             ], stderr=subprocess.PIPE, text=True, check=True)
+        
+        if result.stderr and not "decrease volume?" in result.stderr:
+            logging.warning("'" + name + "' -> " + result.stderr)
+            
+        while "decrease volume?" in result.stderr:
+            if vol > -1.8:
+                vol -= 0.2
+                vol = round(vol, 1)
+            else:
+                logging.warning("'" + name + "' still clipped at vol -1.8dB. bad record!")
+                clip_err = " " + result.stderr
+                break
+
+            logging.warning("'" + name + "' -> " + result.stderr + " vol = " + f"{vol:.1f}dB")
+
+            os.remove(temp_file)
+            
+            result = subprocess.run([
+                "sox_ng", "--temp", temp_dir, "--multi-threaded", "-G", wav, "-b", "16", temp_file, "vol", f"{vol:.1f}dB", "rate", "-v", "-I", "-b", "97","48000", "dither", "-s"
+                ], stderr=subprocess.PIPE, text=True, check=True)
+    finally:
+        for filename in os.listdir(temp_dir):
+            try:
+                os.remove(os.path.join(temp_dir, filename))
+            except: pass
+        try:
+            os.rmdir(temp_dir)
+        except: pass
 
     os.replace(temp_file, os.path.join(directory, f"{name}.wav"))
-    for filename in os.listdir(r"D:\tmp"):
-        if "tmp" in filename:
-            os.remove(os.path.join(r"D:\tmp", filename))
     return vol, clip_err
 
-def wav2opus(wav, cover=None, metadata=None, vol=None, clip_err=""):
+def wav2opus(wav, cover=None, metadata=None, vol=0.0, clip_err=""):
     """将wav转换为opus 嵌入元数据和封面"""
 
     name = os.path.splitext(os.path.basename(wav))[0]
@@ -113,7 +121,7 @@ def wav2opus(wav, cover=None, metadata=None, vol=None, clip_err=""):
                 key = dict.get(key, key.upper()) # 字典的 get(key, default) 方法用于安全获取值
 
                 comments.extend(["--comment", f"{key}={value}"])
-    description = "auto gain(-G). vol " + f"{vol:.1f}dB." + clip_err
+    description = "auto gain(-G)." + (f" vol {vol:.1f}dB." if vol != 0.0 else "") + clip_err
     comments.extend(["--comment", f"DESCRIPTION={description}"])
 
     cmd = [
@@ -131,23 +139,35 @@ def wav2opus(wav, cover=None, metadata=None, vol=None, clip_err=""):
     if metadata:
         os.remove(metadata)
 
-def convert(path):
-    """遍历目录并转换 FLAC 文件"""
+def convert(file, path):
+    """处理单个文件的工作函数"""
 
-    output_dir = os.path.join(path, "wav")
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    for file in tqdm(os.listdir(path)):
+    try:
         file_path = os.path.join(path, file)
-        if os.path.isfile(file_path) and detect_format(file_path) == "flac":
-            name = os.path.splitext(os.path.basename(file_path))[0]
-            temp_file = os.path.join(output_dir, f"{name}.wav") # 临时文件
-            
-            cover, metadata = flac2wav(file_path, temp_file)
-            vol, clip_err = resample(temp_file)
-            wav2opus(temp_file, cover, metadata, vol, clip_err)
+        output_dir = os.path.join(path, "wav")
+        name = os.path.splitext(os.path.basename(file_path))[0]
+        temp_file = os.path.join(output_dir, f"{name}.wav")
+
+        cover, metadata = flac2wav(file_path, temp_file)
+        vol, clip_err = resample(temp_file)
+        wav2opus(temp_file, cover, metadata, vol, clip_err)
+    except Exception as e:
+        logging.error(f"converting '{file}' Failed: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     path = r"D:\[170404~250119]我喜欢的音乐"
-    convert(path)
+    output_dir = os.path.join(path, "wav")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 创建任务列表
+    files = []
+    for file in os.listdir(path):
+        file_path = os.path.join(path, file)
+        if os.path.isfile(file_path) and detect_format(file_path) == "flac":
+            files.append(file)
+
+    # 创建进程池并行处理
+    with Pool(processes=2) as pool:
+        processor = partial(convert, path=path)
+        list(tqdm(pool.imap(processor, files), total=len(files)))
